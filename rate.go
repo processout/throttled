@@ -134,6 +134,10 @@ type GCRARateLimiter struct {
 	emissionInterval time.Duration
 
 	store GCRAStore
+
+	// Maximum number of times to retry SetIfNotExists/CompareAndSwap operations
+	// before returning an error.
+	maxCASAttemptsLimit int
 }
 
 // NewGCRARateLimiter creates a GCRARateLimiter. quota.Count defines
@@ -142,7 +146,20 @@ type GCRARateLimiter struct {
 // rate. For example, PerMin(60) permits 60 requests instantly per key
 // followed by one request per second indefinitely whereas PerSec(1)
 // only permits one request per second with no tolerance for bursts.
+// A default retry limit of 10 will be set.
 func NewGCRARateLimiter(st GCRAStore, quota RateQuota) (*GCRARateLimiter, error) {
+	return NewGCRARateLimiterWithRetryLimit(st, quota, maxCASAttempts)
+}
+
+// NewGCRARateLimiterWithRetryLimit creates a GCRARateLimiter. quota.Count defines
+// the maximum number of requests permitted in an instantaneous burst
+// and quota.Count / quota.Period defines the maximum sustained
+// rate. For example, PerMin(60) permits 60 requests instantly per key
+// followed by one request per second indefinitely whereas PerSec(1)
+// only permits one request per second with no tolerance for bursts.
+// Allows you to send in a retryLimit parameter, which replaces the default retry limit of
+// 10. If you send in a retry limit less than 0, it will default to maxCASAttempts (10)
+func NewGCRARateLimiterWithRetryLimit(st GCRAStore, quota RateQuota, retryLimit int) (*GCRARateLimiter, error) {
 	if quota.MaxBurst < 0 {
 		return nil, fmt.Errorf("invalid RateQuota %#v; MaxBurst must be greater than zero", quota)
 	}
@@ -150,11 +167,16 @@ func NewGCRARateLimiter(st GCRAStore, quota RateQuota) (*GCRARateLimiter, error)
 		return nil, fmt.Errorf("invalid RateQuota %#v; MaxRate must be greater than zero", quota)
 	}
 
+	if retryLimit < 0 {
+		retryLimit = maxCASAttempts
+	}
+
 	return &GCRARateLimiter{
 		delayVariationTolerance: quota.MaxRate.period * (time.Duration(quota.MaxBurst) + 1),
 		emissionInterval:        quota.MaxRate.period,
 		limit:                   quota.MaxBurst + 1,
 		store:                   st,
+		maxCASAttemptsLimit:     retryLimit,
 	}, nil
 }
 
@@ -227,7 +249,7 @@ func (g *GCRARateLimiter) RateLimit(key string, quantity int) (bool, RateLimitRe
 		}
 
 		i++
-		if i > maxCASAttempts {
+		if i >= g.maxCASAttemptsLimit {
 			return false, rlc, fmt.Errorf(
 				"Failed to store updated rate limit data for key %s after %d attempts",
 				key, i,
